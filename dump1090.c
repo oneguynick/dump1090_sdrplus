@@ -49,7 +49,6 @@
 #include <sys/select.h>
 #include "rtl-sdr.h"
 #include "libhackrf/hackrf.h"
-#include "libairspy/airspy.h"
 #include "soxr.h"
 #include "anet.h"
 
@@ -153,7 +152,6 @@ struct {
     int exit;                       /* Exit from the main loop when true. */
 
     /* Drivers */
-    int prefer_airspy;
     int prefer_hackrf;
     int prefer_rtlsdr;
 
@@ -170,12 +168,6 @@ struct {
     int lna_gain;
     int vga_gain;
     hackrf_device *hackrf;
-
-    /* ... but AirSpy needs to be resampled */
-    int airspy_enabled;
-    struct airspy_device *airspy;
-    soxr_t resampler;
-    char *airspy_bytes, *airspy_scratch;
 
     /* SDR Common */
     int freq;
@@ -422,88 +414,10 @@ int modesInitRTLSDR(void) {
         rtlsdr_get_tuner_gain(Modes.dev)/10.0);
     Modes.rtl_enabled = 1;
     Modes.hackrf_enabled = 0;
-    Modes.airspy_enabled = 0;
     return (0);
 }
 
 /* =============================== AirSpy handling ========================== */
-int modesInitAirSpy(void) {
-    #define AIRSPY_STATUS(status, message) \
-        if (status != 0) { \
-            fprintf(stderr, "%s\n", message); \
-            airspy_close(Modes.airspy); \
-            airspy_exit(); \
-            return (1); \
-        } \
-
-    int status;
-    soxr_error_t	sox_err = NULL;
-    soxr_io_spec_t	ios;
-    soxr_quality_spec_t	qts;
-    soxr_runtime_spec_t	rts;
-
-    Modes.airspy_scratch = calloc(2*MODES_DATA_LEN, sizeof(int16_t));
-    Modes.airspy_bytes = malloc(2*MODES_DATA_LEN);
-    if ((Modes.airspy_bytes == NULL) || (Modes.airspy_scratch == NULL))
-	err(1, NULL);
-
-    ios = soxr_io_spec(SOXR_INT16_I, SOXR_INT16_I);
-    qts = soxr_quality_spec(SOXR_MQ, 0);
-    rts = soxr_runtime_spec(2);
-
-    Modes.resampler = soxr_create(10, 2, 2, &sox_err, &ios, &qts, &rts);
-    if (sox_err) {
-        int e = errno;
-        fprintf(stderr, "soxr_create: %s; %s\n", soxr_strerror(sox_err), strerror(errno));
-        return e;
-    }
-
-    status = airspy_init();
-    AIRSPY_STATUS(status, "airspy_init failed.");
-
-    status = airspy_open(&Modes.airspy);
-    AIRSPY_STATUS(status, "No AirSpy compatible devices found.");
-
-    if ((Modes.rf_gain + Modes.lna_gain + Modes.vga_gain) == 0) {
-	Modes.rf_gain = AIRSPY_RF_GAIN;
-	Modes.lna_gain = AIRSPY_LNA_GAIN;
-	Modes.vga_gain = AIRSPY_VGA_GAIN;
-    }
-
-    status = airspy_set_freq(Modes.airspy, Modes.freq);
-    AIRSPY_STATUS(status, "airspy_set_freq failed.");
-
-    status = airspy_set_sample_type(Modes.airspy, AIRSPY_SAMPLE_INT16_IQ);
-    AIRSPY_STATUS(status, "airspy_set_sample_type failed.");
-
-    status = airspy_set_samplerate(Modes.airspy, AIRSPY_SAMPLERATE_10MSPS);
-    AIRSPY_STATUS(status, "airspy_set_samplerate failed.");
-
-    status = airspy_set_mixer_gain(Modes.airspy, Modes.rf_gain != 0);
-    AIRSPY_STATUS(status, "airspy_set_mixer_gain failed.");
-
-    status = airspy_set_lna_gain(Modes.airspy, Modes.lna_gain);
-    AIRSPY_STATUS(status, "airspy_set_lna_gain failed.");
-
-    status = airspy_set_vga_gain(Modes.airspy, Modes.vga_gain);
-    AIRSPY_STATUS(status, "airspy_set_vga_gain failed");
-
-    if (Modes.enable_agc) {
-	airspy_set_mixer_agc(Modes.airspy, 1);
-	AIRSPY_STATUS(status, "airspy_set_mixer_agc failed");
-	airspy_set_lna_agc(Modes.airspy, 1);
-	AIRSPY_STATUS(status, "airspy_set_lna_agc failed");
-    }
-    fprintf (stderr, "AirSpy successfully initialized "
-                     "(RF Gain: %i, LNA Gain: %i, VGA Gain: %i, AGC: %i).\n",
-                     Modes.rf_gain, Modes.lna_gain, Modes.vga_gain, Modes.enable_agc);
-
-    Modes.airspy_enabled = 1;
-    Modes.rtl_enabled = 0;
-    Modes.hackrf_enabled = 0;
-
-    return (0);
-}
 
 /* =============================== HackRF One handling ========================== */
 int modesInitHackRF(void) {
@@ -548,7 +462,6 @@ int modesInitHackRF(void) {
                      Modes.rf_gain, Modes.lna_gain, Modes.vga_gain);
 
     Modes.hackrf_enabled = 1;
-    Modes.airspy_enabled = 0;
     Modes.rtl_enabled = 0;
 
     return (0);
@@ -590,31 +503,6 @@ int hackrfCallback (hackrf_transfer *transfer) {
     memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (MODES_FULL_LEN-1)*4);
     /* Read the new data. */
     memcpy(Modes.data+(MODES_FULL_LEN-1)*4, transfer->buffer, len);
-    Modes.data_ready = 1;
-    /* Signal to the other thread that new data is ready */
-    pthread_cond_signal(&Modes.data_cond);
-    pthread_mutex_unlock(&Modes.data_mutex);
-    return (0);
-}
-
-int airspyCallback (airspy_transfer *transfer) {
-    pthread_mutex_lock(&Modes.data_mutex);
-    int16_t *inptr = (int16_t *)transfer->samples;
-    int16_t *outptr = (int16_t *)Modes.airspy_scratch;
-    size_t i, i_done, o_done, i_len, len;
-
-    i_len = transfer->sample_count;
-    len = 4 * i_len / 5; // downsample from 2.5Msps to 2Msps
-    soxr_process(Modes.resampler, inptr, i_len, &i_done, outptr, len, &o_done);
-    for(i = 0; i < o_done; i++)
-        Modes.airspy_bytes[i] = (int8_t)(outptr[i]>>4)+127;
-    len = o_done;
-    if (len > MODES_DATA_LEN) len = MODES_DATA_LEN;
-    /* Move the last part of the previous buffer, that was not processed,
-     * on the start of the new buffer. */
-    memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (MODES_FULL_LEN-1)*4);
-    /* Read the new data. */
-    memcpy(Modes.data+(MODES_FULL_LEN-1)*4, Modes.airspy_bytes, len);
     Modes.data_ready = 1;
     /* Signal to the other thread that new data is ready */
     pthread_cond_signal(&Modes.data_cond);
@@ -686,14 +574,6 @@ void *readerThreadEntryPoint(void *arg) {
                 hackrf_exit(); 
                 exit (1); 
             } 
-        } else if (Modes.airspy_enabled) {
-            int status = airspy_start_rx(Modes.airspy, airspyCallback, NULL);
-            if (status != 0) {
-                fprintf(stderr, "airspy_start_rx failed");
-                airspy_close(Modes.airspy);
-                airspy_exit();
-                exit (1);
-            }
         }       
     } else {
         readDataFromFile();
@@ -2656,7 +2536,6 @@ void showHelp(void) {
 "--device-index <index>   Select RTL device (default: 0).\n"
 "--dev-rtl                use RTLSDR device.\n"
 "--dev-hackrf             use HackRF device.\n"
-"--dev-airspy             use AirSpy device.\n"
 "--gain <db>              Set RTLSDR gain (default: max gain. Use -100 for auto-gain).\n"
 "--enable-agc             Enable RTLSDR Automatic Gain Control (default: off).\n"
 "--enable-amp             Enable HackRF RX/TX RF amplifier (default: off).\n"
@@ -2734,11 +2613,6 @@ int main(int argc, char **argv) {
 
         if (!strcmp(argv[j],"--device-index") && more) {
             Modes.dev_index = atoi(argv[++j]);
-        } else if (!strcmp(argv[j],"--dev-airspy")) {
-            Modes.rf_gain = AIRSPY_RF_GAIN;
-            Modes.lna_gain = AIRSPY_LNA_GAIN;
-            Modes.vga_gain = AIRSPY_VGA_GAIN;
-            Modes.prefer_airspy = 1;
         } else if (!strcmp(argv[j],"--dev-hackrf")) {
             Modes.rf_gain = HACKRF_RF_GAIN;
             Modes.lna_gain = HACKRF_LNA_GAIN;
@@ -2828,7 +2702,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if ((Modes.prefer_airspy + Modes.prefer_hackrf + Modes.prefer_rtlsdr) > 1) {
+    if ((Modes.prefer_hackrf + Modes.prefer_rtlsdr) > 1) {
         showHelp();
         fprintf(stderr,
             "\n\nError: dev-{airspy,hackrf,rtlsdr} are mutually exclusive.\n");
@@ -2843,12 +2717,10 @@ int main(int argc, char **argv) {
     if (Modes.net_only) {
         fprintf(stderr,"Net-only mode, no RTL device or file open.\n");
     } else if (Modes.filename == NULL) {
-        if ((Modes.prefer_airspy + Modes.prefer_hackrf ) == 0 && modesInitRTLSDR() == 0) {
+        if ((Modes.prefer_hackrf ) == 0 && modesInitRTLSDR() == 0) {
             Modes.rtl_enabled = 1;
-        } else if ((Modes.prefer_airspy + Modes.prefer_rtlsdr ) == 0 &&  modesInitHackRF() == 0 ) {
+        } else if ((Modes.prefer_rtlsdr ) == 0 &&  modesInitHackRF() == 0 ) {
             Modes.hackrf_enabled =  1;
-        } else if ((Modes.prefer_rtlsdr + Modes.prefer_hackrf ) == 0 &&  modesInitAirSpy() == 0 ) {
-            Modes.airspy_enabled =  1;
         } else {
             fprintf(stderr,"No compatible SDR device found.\n");
             exit (1);
